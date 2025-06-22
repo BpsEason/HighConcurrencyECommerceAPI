@@ -1,0 +1,536 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template for High Concurrency E-commerce API (Laravel, ECS Fargate, RDS, ElastiCache, SQS).
+
+Parameters:
+  # VPC and Subnet Parameters
+  VpcId:
+    Type: String
+    Description: The VPC ID where the resources will be deployed.
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of private subnet IDs for RDS, ElastiCache, and ECS tasks.
+  PublicSubnetIds: # For ALB
+    Type: CommaDelimitedList
+    Description: Comma-separated list of public subnet IDs for the Application Load Balancer.
+
+  # Database Parameters (RDS MySQL)
+  DBInstanceType:
+    Type: String
+    Default: db.t3.small
+    Description: RDS DB instance type.
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    Description: RDS DB allocated storage (GB).
+  DBUsername:
+    Type: String
+    Default: admin
+    Description: RDS DB master username.
+  DBPassword:
+    Type: String
+    NoEcho: true # Important: hide sensitive data
+    Description: RDS DB master password.
+  DBName:
+    Type: String
+    Default: hcecommerce
+    Description: Name of the database to create.
+
+  # ElastiCache Redis Parameters
+  RedisNodeType:
+    Type: String
+    Default: cache.t3.micro
+    Description: ElastiCache Redis node type.
+  RedisNumCacheNodes:
+    Type: Number
+    Default: 1
+    Description: Number of ElastiCache Redis cache nodes.
+
+  # ECS Fargate Parameters
+  ClusterName:
+    Type: String
+    Default: HighConcurrencyECommerceAPI-Cluster
+    Description: Name for the ECS Cluster.
+  ServiceName:
+    Type: String
+    Default: HCEcommerceAPI-Service
+    Description: Name for the ECS Service (for API).
+  WorkerServiceName:
+    Type: String
+    Default: HCEcommerceAPI-WorkerService
+    Description: Name for the ECS Service (for Queue Worker).
+  ContainerPort:
+    Type: Number
+    Default: 80
+    Description: Port on which the application container listens (Nginx listens on 80).
+  ImageUrl:
+    Type: String
+    Description: Docker image URL from ECR (e.g., <account-id>.dkr.ecr.<region>.amazonaws.com/repo:tag).
+  CPU:
+    Type: Number
+    Default: 1024 # 1 vCPU
+    Description: CPU units for Fargate tasks (e.g., 256, 512, 1024, 2048, 4096).
+  Memory:
+    Type: Number
+    Default: 2048 # 2 GB
+    Description: Memory (in MiB) for Fargate tasks.
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: Desired number of Fargate API tasks.
+  WorkerDesiredCount:
+    Type: Number
+    Default: 1
+    Description: Desired number of Fargate Worker tasks.
+
+  # ALB Parameters
+  AlbListenerArn:
+    Type: String
+    Description: ARN of an existing ALB Listener to attach the ECS service to.
+    # For a new ALB:
+    # ALBName:
+    #   Type: String
+    #   Default: HCEcommerceAPI-ALB
+    #   Description: Name for the Application Load Balancer.
+
+  # SQS Parameters
+  SqsQueueName:
+    Type: String
+    Default: hce-orders
+    Description: Name of the SQS queue for order processing.
+  SqsDLQName:
+    Type: String
+    Default: hce-orders-dlq
+    Description: Name of the SQS Dead Letter Queue.
+
+  # Security (Key Pair for SSH if needed on bastion/ec2)
+  KeyPairName:
+    Type: String
+    Description: Name of an existing EC2 KeyPair for SSH access (if using EC2 based ECS, or for bastion host).
+
+Resources:
+  # IAM Roles
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRPullAndLogAccess
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/*:log-stream:*
+  
+  ECSTaskRole: # Role for the tasks themselves (e.g., accessing RDS, ElastiCache, SQS for sending/receiving)
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppAccessPolicy
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-db:connect
+                  - elasticache:Connect
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: "*" # Refine this to specific ARNs in production
+
+  # Security Groups
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to RDS and ElastiCache from ECS tasks.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306 # MySQL
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt ECSSecurityGroup.GroupId # Allow from ECS tasks
+        - IpProtocol: tcp
+          FromPort: 6379 # Redis
+          ToPort: 6379
+          SourceSecurityGroupId: !GetAtt ECSSecurityGroup.GroupId # Allow from ECS tasks
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-DBSG"
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow inbound access to ECS tasks from ALB.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId # Allow from ALB
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ECSSG"
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP/HTTPS access to ALB from anywhere.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-ALBSG"
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # RDS Database (MySQL)
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: !Ref DBInstanceType
+      AllocatedStorage: !Ref DBAllocatedStorage
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-db"
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBName: !Ref DBName
+      VPCSecurityGroups:
+        - !GetAtt DBSecurityGroup.GroupId
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false # Important for production
+      StorageType: gp2
+      BackupRetentionPeriod: 7
+      MultiAZ: false # Set to true for production high availability
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for RDS instance.
+      SubnetIds: !Ref SubnetIds
+
+  # ElastiCache Redis
+  ElastiCacheCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: !Sub "${AWS::StackName}-redis-cluster"
+      Engine: redis
+      CacheNodeType: !Ref RedisNodeType
+      NumCacheClusters: !Ref RedisNumCacheNodes
+      Port: 6379
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      SecurityGroupIds:
+        - !GetAtt DBSecurityGroup.GroupId # Allow access from ECS tasks
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      AuthToken: !Base64 Fn::Join: ['', [!Ref "DBPassword", "-redis-auth"]] # Example, use AWS Secrets Manager in prod
+      AutomaticFailoverEnabled: false # Set to true for multi-node production
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Redis"
+
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Subnets for ElastiCache Redis.
+      SubnetIds: !Ref SubnetIds
+
+  # SQS Queue for Order Processing
+  SqsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref SqsQueueName
+      ReceiveMessageWaitTimeSeconds: 20 # Long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SqsDeadLetterQueue.Arn
+        maxReceiveCount: 5 # Number of times a message is retried before moving to DLQ
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OrderQueue"
+
+  # SQS Dead Letter Queue
+  SqsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Ref SqsDLQName
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-OrderDLQ"
+
+  # ECS Task Definition (for API Service)
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-APITask"
+      Cpu: !Ref CPU
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn # For ECS agent to pull images, log to CloudWatch
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn # For application code to access other AWS services
+      ContainerDefinitions:
+        - Name: laravel-api-app
+          Image: !Ref ImageUrl # Docker image from ECR
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: APP_ENV
+              Value: production
+            - Name: APP_KEY
+              Value: A_GENERATED_APP_KEY_FOR_PRODUCTION # Replace with actual APP_KEY
+            - Name: APP_DEBUG
+              Value: "false"
+            - Name: DB_CONNECTION
+              Value: mysql
+            - Name: DB_HOST
+              Value: !GetAtt DBInstance.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt DBInstance.Endpoint.Port
+            - Name: DB_DATABASE
+              Value: !Ref DBName
+            - Name: DB_USERNAME
+              Value: !Ref DBUsername
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: REDIS_HOST
+              Value: !GetAtt ElastiCacheCluster.PrimaryEndPoint.Address
+            - Name: REDIS_PORT
+              Value: !GetAtt ElastiCacheCluster.PrimaryEndPoint.Port
+            - Name: REDIS_PASSWORD # If ElastiCache has AuthToken
+              Value: !Base64 Fn::Join: ['', [!Ref "DBPassword", "-redis-auth"]] # Example, match ElastiCache AuthToken
+            - Name: QUEUE_CONNECTION
+              Value: sqs
+            - Name: AWS_ACCESS_KEY_ID
+              Value: YOUR_AWS_ACCESS_KEY_ID # Consider using AWS Secrets Manager
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: YOUR_AWS_SECRET_ACCESS_KEY # Consider using AWS Secrets Manager
+            - Name: AWS_DEFAULT_REGION
+              Value: !Sub "${AWS::Region}"
+            - Name: SQS_PREFIX
+              Value: !Sub "https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/"
+            - Name: SQS_QUEUE
+              Value: !Ref SqsQueueName
+            - Name: JWT_SECRET
+              Value: A_GENERATED_JWT_SECRET_FOR_PRODUCTION # Replace with actual JWT_SECRET
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Cmd: ["CMD-SHELL", "curl -f http://localhost:${ContainerPort}/ || exit 1"] # Adjust health check path if needed
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # ECS Task Definition (for Worker Service)
+  ECSWorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-WorkerTask"
+      Cpu: !Ref CPU
+      Memory: !Ref Memory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: laravel-worker-app
+          Image: !Ref ImageUrl # Use the same image as API, but will run queue:work
+          Command: ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/laravel-worker.conf"] # Run supervisor for queue workers
+          Environment:
+            - Name: APP_ENV
+              Value: production
+            - Name: APP_KEY
+              Value: A_GENERATED_APP_KEY_FOR_PRODUCTION
+            - Name: APP_DEBUG
+              Value: "false"
+            - Name: DB_CONNECTION
+              Value: mysql
+            - Name: DB_HOST
+              Value: !GetAtt DBInstance.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt DBInstance.Endpoint.Port
+            - Name: DB_DATABASE
+              Value: !Ref DBName
+            - Name: DB_USERNAME
+              Value: !Ref DBUsername
+            - Name: DB_PASSWORD
+              Value: !Ref DBPassword
+            - Name: REDIS_HOST
+              Value: !GetAtt ElastiCacheCluster.PrimaryEndPoint.Address
+            - Name: REDIS_PORT
+              Value: !GetAtt ElastiCacheCluster.PrimaryEndPoint.Port
+            - Name: REDIS_PASSWORD
+              Value: !Base64 Fn::Join: ['', [!Ref "DBPassword", "-redis-auth"]]
+            - Name: QUEUE_CONNECTION
+              Value: sqs
+            - Name: AWS_ACCESS_KEY_ID
+              Value: YOUR_AWS_ACCESS_KEY_ID
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: YOUR_AWS_SECRET_ACCESS_KEY
+            - Name: AWS_DEFAULT_REGION
+              Value: !Sub "${AWS::Region}"
+            - Name: SQS_PREFIX
+              Value: !Sub "https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/"
+            - Name: SQS_QUEUE
+              Value: !Ref SqsQueueName
+            - Name: JWT_SECRET
+              Value: A_GENERATED_JWT_SECRET_FOR_PRODUCTION
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs-worker
+
+  # CloudWatch Log Group
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${AWS::StackName}
+      RetentionInDays: 7 # Adjust as needed
+
+  # ECS Service (for API)
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !GetAtt ECSSecurityGroup.GroupId
+      LoadBalancers:
+        - ContainerName: laravel-api-app
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup # Reference the Target Group created manually or by ALB stack
+      HealthCheckGracePeriodSeconds: 300 # Give tasks time to warm up
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+
+  # ECS Service (for Worker)
+  ECSWorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref WorkerServiceName
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSWorkerTaskDefinition
+      DesiredCount: !Ref WorkerDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !GetAtt ECSSecurityGroup.GroupId
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+
+  # Target Group (Must be created manually or by the ALB CloudFormation stack)
+  # This template assumes an existing ALB Listener and Target Group.
+  # If you need this template to create an ALB and Target Group,
+  # uncomment the ALB-related resources and modify this section.
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-TargetGroup"
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: / # Adjust based on your Laravel health endpoint
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetType: ip
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-TargetGroup"
+
+  ALBListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbListenerArn
+      Priority: 100 # Adjust priority if other rules exist
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/*" # Catch all paths for this service
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  ECSClusterName:
+    Description: "Name of the ECS cluster"
+    Value: !Ref ECSCluster
+  APIServiceName:
+    Description: "Name of the ECS API service"
+    Value: !Ref ECSService
+  WorkerServiceName:
+    Description: "Name of the ECS Worker service"
+    Value: !Ref ECSWorkerService
+  RDSAddress:
+    Description: "RDS database endpoint address"
+    Value: !GetAtt DBInstance.Endpoint.Address
+  RedisAddress:
+    Description: "ElastiCache Redis endpoint address"
+    Value: !GetAtt ElastiCacheCluster.PrimaryEndPoint.Address
+  SqsQueueUrl:
+    Description: "URL of the SQS Queue"
+    Value: !Ref SqsQueue

@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # Laravel PHP-FPM and Nginx service
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: laravel_app
+    restart: always
+    volumes:
+      - .:/var/www/html
+      - /var/www/html/vendor # Avoid host overwriting vendor directory
+    ports:
+      - "80:80" # Map host port 80 to container port 80 (Nginx)
+    environment:
+      - DB_CONNECTION=${DB_CONNECTION:-mysql}
+      - DB_HOST=${DB_HOST:-db}
+      - DB_PORT=${DB_PORT:-3306}
+      - DB_DATABASE=${DB_DATABASE:-hcecommerce}
+      - DB_USERNAME=${DB_USERNAME:-root}
+      - DB_PASSWORD=${DB_PASSWORD:-password}
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-null}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - QUEUE_CONNECTION=${QUEUE_CONNECTION:-sqs} # Use SQS for queue processing
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-ap-northeast-1}
+      - SQS_PREFIX=${SQS_PREFIX:-http://localstack:4566/queue/main} # LocalStack SQS endpoint
+      - SQS_QUEUE=${SQS_QUEUE_NAME:-hce-orders} # SQS queue name
+      - AWS_URL=${AWS_URL:-http://localstack:4566} # LocalStack endpoint for AWS SDK
+      - JWT_SECRET=${JWT_SECRET} # JWT secret from .env
+    depends_on:
+      - db
+      - redis
+      - localstack # Depend on localstack for SQS simulation
+    networks:
+      - app-network
+
+  # MySQL Database Service
+  db:
+    image: mysql:8.0
+    container_name: laravel_db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASS:-your_mysql_root_password}
+      MYSQL_DATABASE: ${DB_NAME:-hcecommerce}
+      MYSQL_USER: ${DB_USER:-root}
+      MYSQL_PASSWORD: ${DB_PASS:-password}
+    volumes:
+      - db_data:/var/lib/mysql # Persist MySQL data
+    ports:
+      - "3306:3306"
+    networks:
+      - app-network
+
+  # Redis Service
+  redis:
+    image: redis:alpine
+    container_name: laravel_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --requirepass "" # For no password in local dev, or add --requirepass
+    volumes:
+      - redis_data:/data # Persist Redis data
+    networks:
+      - app-network
+
+  # LocalStack Service (simulates AWS SQS)
+  localstack:
+    image: localstack/localstack:latest
+    container_name: localstack_sqs
+    ports:
+      - "4566:4566" # SQS default port
+    environment:
+      SERVICES: sqs
+      DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-1}
+      AWS_ACCESS_KEY_ID: test # LocalStack default credentials
+      AWS_SECRET_ACCESS_KEY: test # LocalStack default credentials
+      DOCKER_HOST: unix:///var/run/docker.sock
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock # Allow LocalStack to access Docker daemon
+    networks:
+      - app-network
+    healthcheck: # Ensure LocalStack SQS is ready
+      test: ["CMD-SHELL", "curl -s http://localhost:4566/health | grep \\"sqs\\": \\"running\\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db_data:
+  redis_data:
+  localstack_data:
+
+networks:
+  app-network:
+    driver: bridge
