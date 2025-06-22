@@ -1,0 +1,62 @@
+name: CI/CD to AWS ECS
+
+on:
+  push:
+    branches:
+      - main
+      - develop # 推送到 develop 分支也觸發
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  build-and-deploy:
+    name: Build and Deploy to ECS
+    runs-on: ubuntu-latest
+    environment: production # 可以根據需要設置環境
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-1 # 請替換為您的 AWS 區域
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REPOSITORY: high-concurrency-ecommerce-api # 請替換為您的 ECR 倉庫名稱
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REPOSITORY:$IMAGE_TAG ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Deploy CloudFormation stack
+        uses: aws-actions/aws-cloudformation-github-action@v1
+        with:
+          name: HighConcurrencyECommerceAPI-Stack # CloudFormation 堆疊名稱
+          template: cloudformation-template.yaml
+          parameters: |
+            # 確保這些參數與 cloudformation-template.yaml 中的 Parameters 部分匹配
+            VpcId: your-vpc-id-here
+            SubnetIds: "subnet-xxxx,subnet-yyyy"
+            PublicSubnetIds: "subnet-public-xxxx,subnet-public-yyyy" # New parameter for ALB
+            KeyPairName: your-ec2-keypair-name
+            DBPassword: your-secure-db-password
+            ImageUrl: ${{ env.IMAGE_URI }}
+            AlbListenerArn: arn:aws:elasticloadbalancing:ap-northeast-1:123456789012:listener/app/your-alb/xxxx/yyyyy
+            SqsQueueName: hce-orders # 確保與 env.SQS_QUEUE_NAME 一致
+          capabilities: CAPABILITY_NAMED_IAM
+          region: ap-northeast-1 # 請替換為您的 AWS 區域
+          # no-fail-on-empty-changeset: "true" # 如果沒有變更則不失敗
