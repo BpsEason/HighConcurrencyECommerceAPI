@@ -1,13 +1,12 @@
 # HighConcurrencyECommerceAPI
 
 ## 專案概述
-**HighConcurrencyECommerceAPI** 是一個基於 **Laravel 10.x**（PHP 8.2）的高併發電子商務 API 系統，專為處理高流量訂單交易設計，具備強大的防超賣機制，並深度整合 **AWS 雲端服務**（RDS、ElastiCache、SQS）。此專案展現了我在後端開發、系統架構設計、雲端部署及性能優化的專業能力，特別適合用於技術能力展示。
+**HighConcurrencyECommerceAPI** 是一個基於 **Laravel 10.x**（PHP 8.2）的高併發電子商務 API 系統，專為處理高流量訂單交易設計，具備強大的防超賣機制，並深度整合 **AWS 雲端服務**（RDS、ElastiCache、SQS）。此專案展現了後端開發、系統架構設計、雲端部署及性能優化的專業能力，特別適合用於技術能力展示。
 
 在電商領域，面對秒殺或促銷等高併發場景，確保數據一致性（特別是庫存管理）與快速響應是重大挑戰。本專案提供了一個具備彈性擴展和高吞吐量的 API 解決方案，模擬電商平台的訂單處理核心流程，採用現代 PHP 實踐與雲端原生技術。
 
 - **目標**: 提供一個可擴展、高效能的 API 解決方案，實現實時庫存控制與非同步處理。
 - **關鍵特點**: Redis 原子性庫存管理、SQS 佇列處理、非同步任務執行，以及全面的 AWS CI/CD 整合。
-- **開發起始日期**: 2025 年 6 月 22 日（由 `create_project.sh` 腳本自動生成）。
 
 ## 技術架構
 本專案採用分層、鬆耦合、非同步處理的架構設計，針對高併發與容錯進行優化，與 AWS 服務深度整合。
@@ -112,143 +111,344 @@ graph TD
     style T fill:#fdd,stroke:#333,stroke-width:2px
 ```
 
-## 處理請求的代碼說明
-以下是接受和處理訂單的核心實現，展示如何設計 API 端點並與 Redis 與 SQS 整合。
+## 關鍵代碼與註解
 
 ### API 端點：接受訂單 (/api/orders)
 位於 `app/Http/Controllers/OrderController.php`：
 
 ```php
-use App\Jobs\ProcessOrder;
-use App\Models\Product;
+<?php
+
+namespace App\Http\Controllers;
+
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Redis;
+use Illuminate\Support\Facades\Redis; // 引入 Redis Facade
+use App\Jobs\ProcessOrder;
+use App\Models\Product; // 確保引入 Product 模型
+use App\Models\Order; // 確保引入 Order 模型
+use Illuminate\Support\Str; // 用於生成 UUID
+use App\Http\Controllers\Controller; // 引入基礎控制器，假設它有 successResponse/errorResponse
+use Illuminate\Support\Facades\Log; // for logging
 
-public function store(Request $request)
+class OrderController extends Controller
 {
-    // 驗證請求數據
-    $validated = $request->validate([
-        'product_id' => 'required|exists:products,id',
-        'quantity' => 'required|integer|min:1',
-    ]);
+    /**
+     * 提交訂單
+     * 使用 Redis 進行原子性庫存預扣，防止超賣
+     * @param Request $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function placeOrder(Request $request)
+    {
+        // 1. 驗證請求數據
+        $request->validate([
+            'product_id' => 'required|integer|exists:products,id',
+            'quantity' => 'required|integer|min:1',
+        ]);
 
-    $product = Product::findOrFail($validated['product_id']);
-    $redisKey = "inventory:{$product->id}";
+        $product_id = $request->input('product_id');
+        $quantity = $request->input('quantity');
+        $user_id = auth()->id(); // 獲取當前認證用戶 ID
+        $order_uuid = (string) Str::uuid(); // 生成唯一訂單 UUID
 
-    // 使用 Redis 進行原子性庫存預扣
-    $remainingStock = Redis::decrby($redisKey, $validated['quantity']);
-    if ($remainingStock < 0) {
-        Redis::incrby($redisKey, $validated['quantity']); // 回滾庫存
-        return response()->json(['error' => 'Insufficient stock'], 400);
+        // 2. Redis 原子性庫存預扣 (核心防超賣邏輯)
+        $redisStockKey = "product:stock:{$product_id}";
+        $redisLockedStockKey = "product:stock:locked:{$product_id}";
+        $redisDeductionId = (string) Str::uuid(); // 為本次預扣生成唯一 ID
+
+        // 嘗試從資料庫載入並設定初始庫存到 Redis (如果 Redis 中沒有)
+        if (Redis::get($redisStockKey) === null) {
+            $product = Product::find($product_id);
+            if (!$product) {
+                return $this->errorResponse('商品不存在或已下架', 404);
+            }
+            // 使用 SETNX 確保只有一個請求能設定初始值，避免多個請求同時從 DB 載入
+            if (Redis::setnx($redisStockKey, $product->stock)) {
+                Log::info("Initialized Redis stock for product {$product_id} with {$product->stock} from DB.");
+            }
+        }
+
+        // 使用 Lua Script 進行原子性扣除和鎖定
+        $script = "
+            local stockKey = KEYS[1]
+            local lockedKey = KEYS[2]
+            local quantity = tonumber(ARGV[1])
+            local deductionId = ARGV[2]
+
+            local currentStock = tonumber(redis.call('GET', stockKey) or '0')
+
+            if currentStock >= quantity then
+                redis.call('DECRBY', stockKey, quantity)
+                redis.call('HINCRBY', lockedKey, deductionId, quantity) -- 將預扣數量記錄到 locked key
+                return deductionId
+            else
+                return false
+            end
+        ";
+        $deductionResult = Redis::eval($script, 2, $redisStockKey, $redisLockedStockKey, $quantity, $redisDeductionId);
+
+        if ($deductionResult === false) {
+            return $this->errorResponse('庫存不足，訂單提交失敗', 400);
+        }
+
+        // 3. 創建訂單並設置狀態為 pending
+        // 將 redis_deduction_id 存入訂單，以便 Job 處理失敗時回滾
+        try {
+            $order = Order::create([
+                'order_id' => $order_uuid, // 使用 UUID
+                'user_id' => $user_id,
+                'product_id' => $product_id,
+                'quantity' => $quantity,
+                'total_price' => $quantity * (Product::find($product_id)->price ?? 0),
+                'status' => 'pending',
+                'redis_deduction_id' => $redisDeductionId, // 保存 Redis 預扣 ID
+            ]);
+        } catch (\Exception $e) {
+            // 如果訂單創建失敗，需要釋放 Redis 中預扣的庫存
+            $this->releaseRedisStock($product_id, $redisDeductionId);
+            Log::error("建立臨時訂單失敗，已嘗試釋放 Redis 預扣庫存: " . $e->getMessage(), [
+                'user_id' => $user_id,
+                'product_id' => $product_id,
+                'quantity' => $quantity,
+                'deduction_id' => $redisDeductionId,
+                'error' => $e->getMessage()
+            ]);
+            return $this->errorResponse('訂單建立失敗，請重試', 500);
+        }
+
+        // 4. 將訂單推送到佇列異步處理
+        try {
+            ProcessOrder::dispatch($order->id)->onQueue(config('queue.connections.sqs.queue'));
+            Log::info("訂單已推入佇列", ['order_id' => $order->id, 'redis_deduction_id' => $redisDeductionId]);
+        } catch (\Exception $e) {
+            // 如果推入佇列失敗，則更新訂單狀態為 failed，並釋放 Redis 庫存
+            $order->update(['status' => 'failed', 'failed_reason' => '佇列推送失敗']);
+            $this->releaseRedisStock($product_id, $redisDeductionId);
+            Log::error("推送訂單任務到佇列失敗: " . $e->getMessage(), ['order_id' => $order->id]);
+            return $this->errorResponse('訂單處理系統忙碌，請稍後重試', 503);
+        }
+
+        // 5. 立即回覆，減少用戶等待時間
+        return $this->successResponse('訂單已提交，正在處理中', ['order_uuid' => $order_uuid, 'status' => 'pending'], 202);
     }
 
-    // 將訂單推送到 SQS 佇列進行非同步處理
-    $orderData = [
-        'user_id' => auth()->id(),
-        'product_id' => $product->id,
-        'quantity' => $validated['quantity'],
-        'total' => $product->price * $validated['quantity'],
-    ];
-    ProcessOrder::dispatch($orderData)->onQueue('orders');
+    /**
+     * 釋放預扣的 Redis 庫存。
+     * 使用 Lua 腳本來原子性地將鎖定數量加回主庫存，並刪除鎖定記錄。
+     * 確保即使在高併發或錯誤情況下，庫存回滾也是可靠的。
+     * @param int $productId
+     * @param string $deductionId
+     * @return bool
+     */
+    private function releaseRedisStock(int $productId, string $deductionId): bool
+    {
+        $stockKey = "product:stock:{$productId}";
+        $lockedKey = "product:stock:locked:{$productId}";
 
-    return response()->json(['message' => 'Order placed successfully', 'order' => $orderData], 202);
+        $script = "
+            local stockKey = KEYS[1]
+            local lockedKey = KEYS[2]
+            local deductionId = ARGV[1]
+
+            local releasedQuantity = tonumber(redis.call('HGET', lockedKey, deductionId))
+
+            if releasedQuantity then
+                redis.call('INCRBY', stockKey, releasedQuantity)
+                redis.call('HDEL', lockedKey, deductionId)
+                return true
+            else
+                return false
+            end
+        ";
+        return (bool) Redis::eval($script, 2, $stockKey, $lockedKey, $deductionId);
+    }
 }
 ```
 
 - **功能說明**: 此端點接受客戶端發送的訂單請求，驗證數據後使用 Redis 原子性減少庫存。如果庫存不足，則回滾並返回錯誤；否則，將訂單數據封裝並推送到 SQS 佇列。
-- **性能考量**: 通過 Redis 實現快速庫存檢查，避免資料庫鎖定，提升高併發下的響應速度。
+- **性能考量**: 通過 Redis Lua 腳本實現快速庫存檢查，避免資料庫鎖定，提升高併發下的響應速度。
+- **錯誤處理**: 當訂單創建或佇列推送失敗時，自動回滾 Redis 庫存並記錄錯誤日誌。
 
 ### 佇列工作：處理訂單 (app/Jobs/ProcessOrder.php)
 使用 Laravel 的 Job 系統，與 SQS 整合：
 
 ```php
-use App\Models\Order;
-use App\Models\Product;
+<?php
+
+namespace App\Jobs;
+
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Redis;
+use App\Models\Order;
+use App\Models\Product;
 
 class ProcessOrder implements ShouldQueue
 {
-    use Dispatchable, InteractsWithQueue, Queueable;
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    protected $orderData;
+    protected $orderId;
+    public $tries = 3; // Job 重試次數
+    public $timeout = 60; // Job 超時秒數
+    public $backoff = [5, 10, 15]; // 重試間隔 (秒)
 
-    public function __construct(array $orderData)
+    /**
+     * 構造函數，接收訂單 ID
+     * @param int $orderId 訂單的 ID
+     */
+    public function __construct(int $orderId)
     {
-        $this->orderData = $orderData;
+        $this->orderId = $orderId;
     }
 
+    /**
+     * 執行佇列任務
+     */
     public function handle()
     {
-        // 使用資料庫悲觀鎖驗證庫存
-        $product = Product::lockForUpdate()->find($this->orderData['product_id']);
-        if ($product->stock < $this->orderData['quantity']) {
-            throw new \Exception('Stock verification failed');
+        $order = Order::find($this->orderId);
+
+        // 檢查訂單是否存在或是否已處理
+        if (!$order || $order->status !== 'pending') {
+            Log::warning("訂單狀態不符或不存在，跳過處理。", ['order_id' => $this->orderId, 'status' => $order->status ?? 'N/A']);
+            return;
         }
 
-        // 創建訂單記錄
-        $order = Order::create([
-            'user_id' => $this->orderData['user_id'],
-            'product_id' => $this->orderData['product_id'],
-            'quantity' => $this->orderData['quantity'],
-            'total' => $this->orderData['total'],
-            'status' => 'completed',
-        ]);
+        $productId = $order->product_id;
+        $quantity = $order->quantity;
+        $redisDeductionId = $order->redis_deduction_id;
 
-        // 更新產品庫存
-        $product->decrement('stock', $this->orderData['quantity']);
+        DB::beginTransaction(); // 開始資料庫事務
+        try {
+            // 使用悲觀鎖鎖定商品行，防止資料庫層面的併發問題
+            $product = Product::lockForUpdate()->find($productId);
 
-        // 記錄成功處理
-        \Log::info('Order processed successfully', ['order_id' => $order->id]);
+            if (!$product) {
+                throw new \Exception("商品不存在，無法處理訂單。");
+            }
+
+            // 實際扣減資料庫庫存
+            $product->stock -= $quantity;
+            $product->save();
+
+            // 更新訂單狀態為 completed
+            $order->status = 'completed';
+            $order->save();
+
+            DB::commit(); // 提交事務
+
+            // 移除 Redis 鎖定記錄
+            $this->removeRedisLockedEntry($productId, $redisDeductionId);
+
+            Log::info("訂單處理成功", ['order_id' => $order->id, 'product_id' => $productId, 'quantity' => $quantity]);
+        } catch (\Exception $e) {
+            DB::rollBack(); // 回滾資料庫事務
+            Log::error("訂單處理失敗: " . $e->getMessage(), [
+                'order_id' => $order->id,
+                'product_id' => $productId,
+                'quantity' => $quantity,
+                'deduction_id' => $redisDeductionId,
+                'error' => $e->getMessage()
+            ]);
+
+            // 更新訂單狀態為 failed
+            $order->status = 'failed';
+            $order->failed_reason = $e->getMessage();
+            $order->save();
+
+            // 嘗試釋放 Redis 預扣庫存
+            try {
+                if ($redisDeductionId && $this->releaseRedisStock($productId, $redisDeductionId)) {
+                    Log::info("Redis 預扣庫存已成功釋放", ['order_id' => $order->id, 'product_id' => $productId, 'deduction_id' => $redisDeductionId]);
+                }
+            } catch (\Exception $redisEx) {
+                Log::error("釋放 Redis 庫存失敗: " . $redisEx->getMessage(), [
+                    'order_id' => $order->id,
+                    'product_id' => $productId,
+                    'deduction_id' => $redisDeductionId,
+                    'redis_error' => $redisEx->getMessage()
+                ]);
+            }
+
+            // 觸發重試或進入 DLQ
+            if ($this->attempts() < $this->tries) {
+                throw $e;
+            } else {
+                Log::critical("訂單任務最終失敗", ['order_id' => $order->id, 'attempts' => $this->attempts()]);
+            }
+        }
     }
 
-    public function failed(\Exception $exception)
+    /**
+     * 移除 Redis 鎖定記錄
+     * @param int $productId
+     * @param string $deductionId
+     * @return bool
+     */
+    private function removeRedisLockedEntry(int $productId, string $deductionId): bool
     {
-        // 庫存回滾至 Redis
-        Redis::incrby("inventory:{$this->orderData['product_id']}", $this->orderData['quantity']);
-        \Log::error('Order processing failed', ['error' => $exception->getMessage()]);
+        $lockedKey = "product:stock:locked:{$productId}";
+        return (bool) Redis::hdel($lockedKey, $deductionId);
+    }
+
+    /**
+     * 釋放 Redis 預扣庫存
+     * 使用 Lua 腳本確保原子性操作
+     * @param int $productId
+     * @param string $deductionId
+     * @return bool
+     */
+    private function releaseRedisStock(int $productId, string $deductionId): bool
+    {
+        $stockKey = "product:stock:{$productId}";
+        $lockedKey = "product:stock:locked:{$productId}";
+
+        $script = "
+            local stockKey = KEYS[1]
+            local lockedKey = KEYS[2]
+            local deductionId = ARGV[1]
+
+            local releasedQuantity = tonumber(redis.call('HGET', lockedKey, deductionId))
+
+            if releasedQuantity then
+                redis.call('INCRBY', stockKey, releasedQuantity)
+                redis.call('HDEL', lockedKey, deductionId)
+                return true
+            else
+                return false
+            end
+        ";
+        return (bool) Redis::eval($script, 2, $stockKey, $lockedKey, $deductionId);
+    }
+
+    /**
+     * 處理最終失敗的任務
+     * @param \Throwable $exception
+     */
+    public function failed(\Throwable $exception)
+    {
+        Log::critical("訂單處理任務最終失敗", [
+            'order_id' => $this->orderId,
+            'exception_message' => $exception->getMessage(),
+            'attempts_made' => $this->attempts()
+        ]);
+
+        $order = Order::find($this->orderId);
+        if ($order && $order->status === 'pending') {
+            $order->update(['status' => 'failed', 'failed_reason' => '任務最終失敗: ' . $exception->getMessage()]);
+        }
     }
 }
 ```
 
 - **功能說明**: 佇列工作者從 SQS 消費訂單任務，使用資料庫悲觀鎖驗證庫存，確保數據一致性。成功時創建訂單並更新庫存，失敗時回滾 Redis 庫存並記錄錯誤。
-- **容錯設計**: `failed` 方法處理異常情況，確保系統穩定性並提供診斷信息。
-
-## 常見問題與解答
-### 專案概述與動機
-- **目標與痛點**: 專案目標是解決電商秒殺場景下的庫存超賣與延遲問題，通過非同步處理與快取提升效率，解決高併發下的數據一致性與性能瓶頸。
-- **為何選 Laravel + AWS**: Laravel 提供強大的 ORM 和佇列支持，AWS 提供可擴展的雲服務（如 ECS 和 SQS），兩者結合實現高併發與高可用性。
-- **最大技術挑戰**: 高併發下的庫存一致性，通過 Redis 原子操作與 SQS 解耦克服，見 `ProcessOrder` 代碼。
-
-### 核心功能與設計細節
-- **為何選 JWT**: JWT 無狀態，適合分散式系統，減少伺服器負載，優勢在於跨服務認證。
-- **JWT 刷新機制**: `/api/refresh` 使用短效 token 搭配刷新 token，安全性通過 HTTPS 和 token 有效期限制保障。
-- **Redis 原子性庫存**: 使用 `Redis::decrby` 實現原子預扣，流程見 `OrderController`；一致性通過佇列工作中的 `lockForUpdate` 保證。
-- **Redis 到 MySQL 同步**: 佇列工作驗證庫存並更新 MySQL，原子性由資料庫事務確保。
-- **為何用 SQS**: SQS 解耦 API 與處理邏輯，提升吞吐量；失敗訊息由 DLQ 保留，確保不丟失。
-- **非同步 vs lockForUpdate**: 非同步優先處理高併發，`lockForUpdate` 用於最終驗證，結合兩者提升效率與一致性。
-
-### 系統架構與 AWS 服務
-- **請求生命週期**: 用戶 -> ALB -> ECS -> Redis 預扣 -> SQS 推入 -> 佇列工作更新 MySQL。
-- **為何選 Fargate**: Fargate 無伺服器管理，優勢在於彈性與成本優化，劣勢是對自定義配置有限。
-- **CloudFormation 資源**: 定義 ALB、ECS、RDS、ElastiCache、SQS，必要性在於自動化部署與資源管理。
-- **監控指標**: 關注 API 延遲、錯誤率、佇列深度，通過 CloudWatch 實時追蹤。
-- **CI/CD 流程**: GitHub Actions 自動建構、推送 ECR，並觸發 CloudFormation 部署。
-
-### 性能優化與擴展性
-- **優化實現**: 快取用 `Cache::remember`，索引優化見遷移，SQS 設 60 秒可見性。
-- **水平擴展**: ECS 根據 CPU 使用率自動擴展，ALB 動態分配流量。
-- **驗證工具**: 使用 Locust 壓力測試，驗證延遲與成功率。
-- **Locust 解讀**: 200ms 平均延遲，99.9% 成功率，進一步優化可調整 PHP-FPM 參數。
-
-### 技術貢獻
-- **關鍵決策**: 設計 Redis 防超賣與 SQS 非同步處理，提升系統穩定性。
-- **性能調優**: PHP-FPM 設 `pm.max_children = 50`，Redis Lua 腳本減少 40% 延遲。
-- **程式碼品質**: PHPUnit 覆蓋率 85%，包含單元與功能測試。
-- **重新設計考量**: 可能引入 Kafka 替代 SQS，提升大規模訊息處理效率。
+- **容錯設計**: 使用事務管理資料庫操作，失敗時回滾並釋放 Redis 庫存，支援重試機制與 DLQ 處理。
+- **性能考量**: 通過 Redis 預扣庫存與 SQS 解耦，減少 API 端點的阻塞，提升吞吐量。
 
 ## 核心功能
 - **用戶認證**: 採用 JWT 認證（基於 `tymon/jwt-auth`），提供 `/api/register`、`/api/login`、`/api/logout`、`/api/me`、`/api/refresh` 端點。
@@ -260,21 +460,13 @@ class ProcessOrder implements ShouldQueue
   - **ElastiCache Redis**: 實時庫存與快取，壓力測試顯示減少約 70% 資料庫負載。
 
 ## 性能優化策略
-1. **快取**: 利用 `Illuminate\Support\Facades\Cache` 與 Redis 快取產品詳情，範例：`Cache::remember('product:' . $id, $ttl, fn() => Product::find($id));`。
+1. **快取**: 利用 `Illuminate\Support\Facades\Cache` 與 Redis 快取產品詳情，範例：
+   ```php
+   Cache::remember('product:' . $id, $ttl, fn() => Product::find($id));
+   ```
 2. **資料庫索引**: 在遷移中為 `orders.user_id` 和 `orders.product_id` 添加索引，通過 `EXPLAIN` 驗證。
 3. **佇列效率**: SQS 配置 60 秒可見性超時與 14 天保留期，平衡吞吐量與訊息持久性。
 4. **負載測試**: Locust 模擬 1000 用戶，99.9% 成功率，平均延遲 200ms，Redis 處理 10k+ ops/sec。
-
-## 擴展性與維護
-- **水平擴展**: ECS 服務根據 CPU 使用率（目標 70%）或 ALB 請求數自動擴展，透過 CloudFormation 參數調整。
-- **監控**: CloudWatch Logs 和 Metrics 追蹤 API 延遲、錯誤率與佇列深度，異常時觸發警報。
-- **維護**: RDS 7 天自動備份與 GitHub Actions 零停機部署確保可靠性。
-
-## 技術貢獻
-- **系統設計**: 設計 Redis 防超賣機制，在 10k 併發請求下實現 100% 庫存一致性。
-- **性能調優**: 優化 PHP-FPM 設定（例如 `pm.max_children = 50`）與 Redis Lua 腳本，提升 40% 吞吐量。
-- **雲端整合**: 配置 AWS ECS、SQS 與 CloudFormation 模板，確保無縫部署與擴展。
-- **代碼品質**: 實現 PHPUnit 單元測試與功能測試，覆蓋率達 85%，詳細日誌便於調試。
 
 ## 快速入門
 ### 前置條件
@@ -305,10 +497,6 @@ class ProcessOrder implements ShouldQueue
 - 在 GitHub Secrets 中設置 AWS 認證。
 - 更新 `cloudformation-template.yaml` 的 VPC、子網與 ALB 詳情。
 - 推送至 `main` 分支觸發 CI/CD 部署。
-
-## 測試與驗證
-- **負載測試**: 運行 `locust -f docs/locustfile.py --host=http://localhost` 模擬 1000 用戶，驗證防超賣與延遲。
-- **監控**: 檢查 CloudWatch Logs (`/ecs/laravel-app`) 確認錯誤或性能瓶頸。
 
 ## 聯繫與貢獻
 - **作者**: [您的姓名] (@BpsEason)
