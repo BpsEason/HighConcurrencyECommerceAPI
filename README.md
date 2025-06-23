@@ -368,10 +368,3 @@ class ProcessOrder implements ShouldQueue
 - 更新 `cloudformation-template.yaml` 的 VPC、子網和 ALB 設定。
 - 推送至 `main` 分支觸發 CI/CD。
 
-## 聯繫與貢獻
-- **作者**: [您的姓名] (@BpsEason)
-- **聯繫**: [your.email@example.com] 或 GitHub Issues
-- **貢獻**: 歡迎提交拉取請求或建議
-
-## 授權
-MIT 授權（見 `LICENSE` 文件，待添加）。
